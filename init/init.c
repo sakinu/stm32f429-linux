@@ -23,7 +23,8 @@ int main()
 {
     printf("Mounting rootfs\n");
     mount("proc", "/proc", "proc", 0, NULL);
-    while (mount("/dev/mmcblk0p1", MOUNT_POINT, "ext2", 0, 0));
+    // noatime: reads must not dirty inodes, every SD write risks the SDIO hang
+    while (mount("/dev/mmcblk0p1", MOUNT_POINT, "ext2", MS_NOATIME, 0));
     print_meminfo();
     char *argv[] = { "sh", NULL };
     char *envp[] = {
