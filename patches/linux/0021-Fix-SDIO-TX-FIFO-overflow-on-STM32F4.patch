@@ -1,0 +1,111 @@
+From 12295f63b58b36a4983206dee4de570fc96f13ed Mon Sep 17 00:00:00 2001
+From: sakinu <sakinu@sakinu.localdomain>
+Date: Tue, 17 Nov 2026 03:21:17 +0800
+Subject: [PATCH 21/21] Fix SDIO TX FIFO overflow on STM32F4
+
+On STM32F42x/43x, once SDIO HW flow control has gated the bus clock,
+TXFIFOE can be set while a word is still in the FIFO. mmci then writes a
+full FIFO, the extra words are dropped, and the data path waits forever
+for them with the clock gated: the write never completes and all SD I/O
+hangs (errata ES0206, "Wrong data written during SDIO hardware flow
+control").
+
+Size each TX burst from the free space derived from MMCIFIFOCNT (words
+the data path has yet to pull) instead of trusting TXFIFOE.
+
+Measured with a 4 MB raw write: stock hung 3/3 (~300 lost words each),
+fixed 5/5 completed (4.0-5.0 s, with printk load too), data verified.
+
+Signed-off-by: sakinu <sakinu@sakinu.localdomain>
+---
+ drivers/mmc/host/mmci.c | 22 ++++++++++++++++++++++
+ drivers/mmc/host/mmci.h |  5 +++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/drivers/mmc/host/mmci.c b/drivers/mmc/host/mmci.c
+index e500051..7b76235 100644
+--- a/drivers/mmc/host/mmci.c
++++ b/drivers/mmc/host/mmci.c
+@@ -250,6 +250,7 @@ static struct variant_data variant_stm32 = {
+ 	.pwrreg_clkgate		= true,
+ 	.pwrreg_nopower		= true,
+ 	.dma_flow_controller	= true,
++	.tx_fifocnt_room	= true,
+ 	.init			= mmci_variant_init,
+ };
+ 
+@@ -1293,6 +1294,8 @@ static void mmci_start_data(struct mmci_host *host, struct mmc_data *data)
+ 
+ 	/* IRQ mode, map the SG list for CPU reading/writing */
+ 	mmci_init_sg(host, data);
++	host->tx_words = (host->size + 3) >> 2;
++	host->tx_words_written = 0;
+ 
+ 	if (data->flags & MMC_DATA_READ) {
+ 		irqmask = MCI_RXFIFOHALFFULLMASK;
+@@ -1667,6 +1670,24 @@ static int mmci_pio_write(struct mmci_host *host, char *buffer, unsigned int rem
+ 
+ 		maxcnt = status & MCI_TXFIFOEMPTY ?
+ 			 variant->fifosize : variant->fifohalfsize;
++
++		if (variant->tx_fifocnt_room) {
++			/*
++			 * STM32F4: once HW flow control has gated the clock,
++			 * TXFIFOE can be set while a word is still queued; a
++			 * full-FIFO burst then overflows and drops words, so
++			 * the transfer never ends (errata ES0206). MMCIFIFOCNT
++			 * counts the words the data path has yet to pull, so
++			 * the FIFO holds written - (total - FIFOCNT) words.
++			 */
++			int queued = host->tx_words_written -
++				(host->tx_words - readl(base + MMCIFIFOCNT));
++			int room = variant->fifosize - max(queued, 0) * 4;
++
++			if (room <= 0)
++				break;
++			maxcnt = min_t(unsigned int, maxcnt, room);
++		}
+ 		count = min(remain, maxcnt);
+ 
+ 		/*
+@@ -1678,6 +1699,7 @@ static int mmci_pio_write(struct mmci_host *host, char *buffer, unsigned int rem
+ 		 * 32bit writes etc.
+ 		 */
+ 		iowrite32_rep(base + MMCIFIFO, ptr, (count + 3) >> 2);
++		host->tx_words_written += (count + 3) >> 2;
+ 
+ 		ptr += count;
+ 		remain -= count;
+diff --git a/drivers/mmc/host/mmci.h b/drivers/mmc/host/mmci.h
+index 4d3647f..dd9ac5c 100644
+--- a/drivers/mmc/host/mmci.h
++++ b/drivers/mmc/host/mmci.h
+@@ -307,6 +307,8 @@ enum mmci_busy_state {
+  * @datactrl_first: true if data must be setup before send command
+  * @datacnt_useless: true if you could not use datacnt register to read
+  *		     remaining data
++ * @tx_fifocnt_room: true if TXFIFOEMPTY can't be trusted: size each TX burst
++ *		     from the free FIFO space derived from MMCIFIFOCNT
+  * @pwrreg_powerup: power up value for MMCIPOWER register
+  * @f_max: maximum clk frequency supported by the controller.
+  * @signal_direction: input/out direction of bus signals can be indicated
+@@ -356,6 +358,7 @@ struct variant_data {
+ 	u8			dma_power_of_2:1;
+ 	u8			datactrl_first:1;
+ 	u8			datacnt_useless:1;
++	u8			tx_fifocnt_room:1;
+ 	u8			st_sdio:1;
+ 	u8			st_clkdiv:1;
+ 	u8			stm32_clkdiv:1;
+@@ -452,6 +455,8 @@ struct mmci_host {
+ 	/* pio stuff */
+ 	struct sg_mapping_iter	sg_miter;
+ 	unsigned int		size;
++	unsigned int		tx_words;		/* words in this transfer */
++	unsigned int		tx_words_written;	/* words put in the FIFO */
+ 	int (*get_rx_fifocnt)(struct mmci_host *h, u32 status, int remain);
+ 
+ 	u8			use_dma:1;
+-- 
+2.47.3
+
